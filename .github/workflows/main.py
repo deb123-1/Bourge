@@ -1,467 +1,272 @@
-# ————————————————————————————————————————————
-#  TG MODERATION BOT WITH ADMIN LEVELS (v2)
-#  pip install python-telegram-bot==20.5 aiosqlite
-# ————————————————————————————————————————————
-
-import logging
 import asyncio
-import aiosqlite
-from datetime import datetime, timedelta
-from telegram import (
-    Update,
-    ChatPermissions,
-    ChatMember,
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    ChatMemberHandler,
-    MessageHandler,
-    filters,
-)
+import sqlite3
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ————— YOUR SETTINGS —————
-BOT_TOKEN = "ТОКЕН_СЮДА"
-DB_PATH = "iris_bot.db"
-MOD_LOG_CHAT = 0  # чат, куда бот скидывает логи (0 = выкл)
-WELCOME_TEXT = "Йо, {name}! Добро пожаловать в {chat}. Правила ниже 🔻"
+# ==========================
+# CONFIG
+# ==========================
+TOKEN = "ВАШ_ТОКЕН_СЮДА"
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-DEFAULT_RULES = """1) Не флудим
-2) Не бомбим в чат оскорбами
-3) Рекламу — в мусорку
-4) Модеры тут — как судьи, их слово финальное
-"""
+# ==========================
+# БАЗА ДАННЫХ
+# ==========================
+db = sqlite3.connect("bot.db")
+cursor = db.cursor()
 
-# ————— LEVELS —————
-LEVEL_NAMES = {
-    1: "Хелпер",
-    2: "Модер",
-    3: "Старший модер",
-    4: "Админ",
-    5: "Владелец"
-}
+cursor.execute("""CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    messages INTEGER DEFAULT 0,
+    warns INTEGER DEFAULT 0,
+    mutes INTEGER DEFAULT 0,
+    bans INTEGER DEFAULT 0,
+    role TEXT DEFAULT 'user'
+)""")
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("BOT")
+cursor.execute("""CREATE TABLE IF NOT EXISTS tasks(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    creator_id INTEGER,
+    text TEXT,
+    status TEXT DEFAULT 'active'
+)""")
 
+cursor.execute("""CREATE TABLE IF NOT EXISTS triggers(
+    trigger TEXT,
+    response TEXT
+)""")
 
-# ——————————————————————— DB INIT ———————————————————————
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER,
-                user_id INTEGER,
-                level INTEGER,
-                PRIMARY KEY (chat_id, user_id)
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS warns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
-                mod_id INTEGER,
-                reason TEXT,
-                time TEXT
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS rules (
-                chat_id INTEGER PRIMARY KEY,
-                text TEXT
-            )
-        """)
-
-        await db.commit()
+db.commit()
 
 
-# ——————————————————————— DB HELPERS ———————————————————————
-async def get_level(chat_id, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT level FROM users WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        row = await cur.fetchone()
-        return row[0] if row else 0
+# ==========================
+# ФУНКЦИИ РАБОТЫ С БД
+# ==========================
+def add_user(uid):
+    cursor.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (uid,))
+    db.commit()
+
+def add_message(uid):
+    cursor.execute("UPDATE users SET messages = messages + 1 WHERE user_id = ?", (uid,))
+    db.commit()
+
+def set_role(uid, role):
+    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, uid))
+    db.commit()
+
+def get_role(uid):
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (uid,))
+    row = cursor.fetchone()
+    return row[0] if row else "user"
+
+def warn_user(uid):
+    cursor.execute("UPDATE users SET warns = warns + 1 WHERE user_id = ?", (uid,))
+    db.commit()
+
+def mute_user(uid):
+    cursor.execute("UPDATE users SET mutes = mutes + 1 WHERE user_id = ?", (uid,))
+    db.commit()
+
+def ban_user(uid):
+    cursor.execute("UPDATE users SET bans = bans + 1 WHERE user_id = ?", (uid,))
+    db.commit()
 
 
-async def set_level(chat_id, user_id, level):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO users (chat_id, user_id, level)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chat_id, user_id)
-            DO UPDATE SET level=excluded.level
-        """, (chat_id, user_id, level))
-        await db.commit()
+# ==========================
+# КНОПКИ
+# ==========================
+def main_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📌 Задачи", callback_data="tasks")
+    kb.button(text="⚠️ Наказания", callback_data="punish")
+    kb.button(text="📊 Аналитика", callback_data="stats")
+    kb.button(text="🤖 Автоответы", callback_data="triggers")
+    kb.adjust(2)
+    return kb.as_markup()
 
 
-async def add_warn(chat_id, user_id, mod_id, reason):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO warns (chat_id, user_id, mod_id, reason, time) VALUES (?, ?, ?, ?, ?)",
-                         (chat_id, user_id, mod_id, reason, datetime.utcnow()))
-        await db.commit()
+# ==========================
+# СТАРТ
+# ==========================
+@dp.message(Command("start"))
+async def start_cmd(msg: Message):
+    add_user(msg.from_user.id)
+    await msg.answer("Йо, я тут, готов рулить чатом 😎", reply_markup=main_menu())
 
 
-async def get_warns(chat_id, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT mod_id, reason, time FROM warns WHERE chat_id=? AND user_id=? ORDER BY id ASC",
-                               (chat_id, user_id))
-        return await cur.fetchall()
+# ==========================
+# СТАТИСТИКА
+# ==========================
+@dp.callback_query(F.data == "stats")
+async def show_stats(cb: CallbackQuery):
+    uid = cb.from_user.id
+    cursor.execute("SELECT messages, warns, mutes, bans, role FROM users WHERE user_id = ?", (uid,))
+    m, w, mute, b, r = cursor.fetchone()
 
-
-async def clear_warns(chat_id, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        await db.commit()
-
-
-async def get_rules(chat_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT text FROM rules WHERE chat_id=?", (chat_id,))
-        row = await cur.fetchone()
-        return row[0] if row else None
-
-
-async def set_rules(chat_id, text):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO rules (chat_id, text) VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET text=excluded.text
-        """, (chat_id, text))
-        await db.commit()
-
-
-# ——————————————————————— UTILS ———————————————————————
-async def log_action(text, context):
-    if MOD_LOG_CHAT != 0:
-        try:
-            await context.bot.send_message(MOD_LOG_CHAT, text)
-        except:
-            pass
-
-
-def check_level(level, need):
-    return level >= need
-
-
-async def get_target(update, context):
-    if update.message.reply_to_message:
-        return update.message.reply_to_message.from_user
-    if context.args:
-        try:
-            uid = int(context.args[0])
-            member = await update.effective_chat.get_member(uid)
-            return member.user
-        except:
-            return None
-    return None
-
-
-# ————————————————————— COMMANDS —————————————————————
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Йоу, я мод-бот. Пиши /rules — узнаешь, что к чему 🤙")
-
-
-async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rules = await get_rules(update.effective_chat.id) or DEFAULT_RULES
-    await update.message.reply_text("Правила чата:\n\n" + rules)
-
-
-async def setrules(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lvl = await get_level(update.effective_chat.id, update.effective_user.id)
-    if not check_level(lvl, 4):
-        await update.message.reply_text("Тебе рановато в админку 😭")
-        return
-
-    text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("Напиши новые правила после команды.")
-        return
-
-    await set_rules(update.effective_chat.id, text)
-    await update.message.reply_text("Правила обновлены.")
-    await log_action(f"📝 {update.effective_user.full_name} обновил правила.", context)
-
-
-async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-
-    author_lvl = await get_level(chat.id, user.id)
-    if not check_level(author_lvl, 5):
-        await update.message.reply_text("Ты не можешь раздавать роли.")
-        return
-
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text("Формат: /setlevel <reply> <1-5>")
-        return
-
-    target = await get_target(update, context)
-    if not target:
-        await update.message.reply_text("Юзер не найден.")
-        return
-
-    if str(context.args[-1]).isdigit():
-        lvl = int(context.args[-1])
-    else:
-        await update.message.reply_text("Укажи уровень 1-5.")
-        return
-
-    if lvl < 1 or lvl > 5:
-        await update.message.reply_text("Уровень должен быть 1-5.")
-        return
-
-    if target.id == user.id:
-        await update.message.reply_text("Нельзя выдавать уровни себе.")
-        return
-
-    await set_level(chat.id, target.id, lvl)
-    await update.message.reply_text(f"{target.full_name} теперь {LEVEL_NAMES[lvl]} 🔥")
-    await log_action(f"⚡ {user.full_name} выставил {LEVEL_NAMES[lvl]} пользователю {target.full_name}", context)
-
-
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target = await get_target(update, context) or update.effective_user
-    lvl = await get_level(update.effective_chat.id, target.id)
-
-    await update.message.reply_text(
-        f"👤 {target.full_name}\n"
-        f"ID: {target.id}\n"
-        f"Роль: {LEVEL_NAMES.get(lvl, 'Гость')}"
+    await cb.message.edit_text(
+        f"📊 *Твоя аналитика:* \n"
+        f"Сообщений: **{m}**\n"
+        f"Предупреждений: **{w}**\n"
+        f"Mute: **{mute}**\n"
+        f"Ban: **{b}**\n"
+        f"Роль: **{r}**",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
     )
 
 
-# ——————————— WARN ———————————
-async def warn(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    lvl = await get_level(chat.id, user.id)
-
-    if not check_level(lvl, 2):
-        await update.message.reply_text("Тебе нельзя выдавать варны.")
-        return
-
-    target = await get_target(update, context)
-    if not target:
-        await update.message.reply_text("Не нашёл пользователя.")
-        return
-    
-    if await get_level(chat.id, target.id) >= lvl:
-        await update.message.reply_text("Нельзя мутить/варнить равного или выше.")
-        return
-
-    reason = " ".join(context.args[1:]) if context.args else "Без причины"
-    await add_warn(chat.id, target.id, user.id, reason)
-
-    w = await get_warns(chat.id, target.id)
-    count = len(w)
-
-    await update.message.reply_text(
-        f"⚠ Варн выдан {target.full_name}\nПричина: {reason}\nВсего: {count}"
-    )
-    await log_action(f"⚠ {user.full_name} выдал варн {target.full_name}. Причина: {reason}", context)
+# ==========================
+# ЗАДАЧИ
+# ==========================
+@dp.callback_query(F.data == "tasks")
+async def tasks_menu(cb: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить", callback_data="task_add")
+    kb.button(text="📋 Список", callback_data="task_list")
+    kb.adjust(2)
+    await cb.message.edit_text("Управление задачами:", reply_markup=kb.as_markup())
 
 
-async def warns_list(update, context):
-    target = await get_target(update, context) or update.effective_user
-    rows = await get_warns(update.effective_chat.id, target.id)
+# Добавление задачи
+@dp.callback_query(F.data == "task_add")
+async def wait_task_text(cb: CallbackQuery):
+    await cb.message.edit_text("Отправь текст задачи:")
 
+    @dp.message()
+    async def add_task(msg: Message):
+        cursor.execute("INSERT INTO tasks (creator_id, text) VALUES (?,?)",
+                       (msg.from_user.id, msg.text))
+        db.commit()
+        await msg.answer("Готово, задача добавлена ✔️")
+        dp.message.handlers.pop()
+
+
+# Список задач
+@dp.callback_query(F.data == "task_list")
+async def show_task_list(cb: CallbackQuery):
+    cursor.execute("SELECT id, text, status FROM tasks WHERE status='active'")
+    rows = cursor.fetchall()
     if not rows:
-        await update.message.reply_text("Варнов нет.")
+        await cb.message.edit_text("Список пуст.", reply_markup=main_menu())
         return
 
-    txt = f"⚠ Варны {target.full_name}:\n\n"
-    for w in rows:
-        mod_id, reason, time = w
-        txt += f"- {reason} (от {mod_id}, время: {time})\n"
+    text = "📌 *Активные задачи:*\n\n"
+    for tid, t, s in rows:
+        text += f"• `{tid}` — {t}\n"
 
-    await update.message.reply_text(txt)
-
-
-async def clearwarns(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    lvl = await get_level(chat.id, user.id)
-
-    if not check_level(lvl, 3):
-        await update.message.reply_text("Тебе нельзя чистить варны.")
-        return
-
-    target = await get_target(update, context)
-    if not target:
-        return await update.message.reply_text("Не найден.")
-
-    await clear_warns(chat.id, target.id)
-    await update.message.reply_text(f"Варны {target.full_name} очищены.")
-    await log_action(f"♻ {user.full_name} очистил варны {target.full_name}", context)
+    await cb.message.edit_text(text, reply_markup=main_menu(), parse_mode="Markdown")
 
 
-# ——————————— MUTE / UNMUTE ———————————
-async def mute(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    lvl = await get_level(chat.id, user.id)
-
-    if not check_level(lvl, 2):
-        return await update.message.reply_text("Недостаточно прав.")
-
-    target = await get_target(update, context)
-    if not target:
-        return await update.message.reply_text("Не найден.")
-
-    if await get_level(chat.id, target.id) >= lvl:
-        return await update.message.reply_text("Нельзя мутить равного/старшего.")
-
-    minutes = int(context.args[-1]) if context.args and context.args[-1].isdigit() else 5
-    until = datetime.utcnow() + timedelta(minutes=minutes)
-
-    perms = ChatPermissions(can_send_messages=False)
-    await context.bot.restrict_chat_member(chat.id, target.id, perms, until)
-
-    await update.message.reply_text(f"{target.full_name} замьючен на {minutes} минут 🔇")
-    await log_action(f"🔇 {user.full_name} замутил {target.full_name} на {minutes} минут", context)
+# ==========================
+# НАКАЗАНИЯ
+# ==========================
+@dp.callback_query(F.data == "punish")
+async def punish_menu(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "Выбери наказание:\n/mute ID\n/warn ID\n/ban ID",
+        reply_markup=main_menu()
+    )
 
 
-async def unmute(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    lvl = await get_level(chat.id, user.id)
+@dp.message(Command("warn"))
+async def warn_cmd(msg: Message):
+    if len(msg.text.split()) < 2:
+        return await msg.answer("Укажи ID: /warn 123")
 
-    if not check_level(lvl, 3):
-        return await update.message.reply_text("Недостаточно прав.")
-
-    target = await get_target(update, context)
-    if not target:
-        return await update.message.reply_text("Не найден.")
-
-    perms = ChatPermissions(can_send_messages=True)
-    await context.bot.restrict_chat_member(chat.id, target.id, perms)
-    await update.message.reply_text(f"{target.full_name} теперь может писать 🗣")
-    await log_action(f"🔊 {user.full_name} анмутнул {target.full_name}", context)
+    uid = int(msg.text.split()[1])
+    warn_user(uid)
+    await msg.answer(f"Пользователь {uid} получил warn 🔥")
 
 
-# ——————————— KICK / BAN ———————————
-async def kick(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
+@dp.message(Command("mute"))
+async def mute_cmd(msg: Message):
+    if len(msg.text.split()) < 2:
+        return await msg.answer("Укажи ID: /mute 123")
 
-    lvl = await get_level(chat.id, user.id)
-    if not check_level(lvl, 3):
-        return await update.message.reply_text("Недостаточно прав.")
-
-    target = await get_target(update, context)
-    if not target:
-        return await update.message.reply_text("Не найден.")
-
-    if await get_level(chat.id, target.id) >= lvl:
-        return await update.message.reply_text("Нельзя трогать равного/старшего.")
-
-    await chat.ban_member(target.id, until_date=datetime.utcnow() + timedelta(seconds=5))
-    await update.message.reply_text(f"{target.full_name} был кикнут 👢")
-    await log_action(f"👢 {user.full_name} кикнул {target.full_name}", context)
+    uid = int(msg.text.split()[1])
+    mute_user(uid)
+    await msg.answer(f"{uid} в муте 😶")
 
 
-async def ban(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    lvl = await get_level(chat.id, user.id)
+@dp.message(Command("ban"))
+async def ban_cmd(msg: Message):
+    if len(msg.text.split()) < 2:
+        return await msg.answer("Укажи ID: /ban 123")
 
-    if not check_level(lvl, 4):
-        return await update.message.reply_text("Баны доступны с уровня 4.")
-
-    target = await get_target(update, context)
-    if not target:
-        return await update.message.reply_text("Не найден.")
-
-    if await get_level(chat.id, target.id) >= lvl:
-        return await update.message.reply_text("Ты не можешь банить равного/старшего.")
-
-    await chat.ban_member(target.id)
-    await update.message.reply_text(f"{target.full_name} забанен 🔥")
-    await log_action(f"🔨 {user.full_name} забанил {target.full_name}", context)
+    uid = int(msg.text.split()[1])
+    ban_user(uid)
+    await msg.answer(f"{uid} забанен 🚫")
 
 
-async def unban(update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    lvl = await get_level(chat.id, user.id)
-
-    if not check_level(lvl, 4):
-        return await update.message.reply_text("Недостаточно прав.")
-
-    if not context.args:
-        return await update.message.reply_text("Укажи ID.")
-
-    uid = int(context.args[0])
-    await chat.unban_member(uid)
-    await update.message.reply_text(f"{uid} разбанен.")
-    await log_action(f"♻ {user.full_name} разбанил {uid}", context)
+# ==========================
+# ТРИГГЕРЫ / АВТООТВЕТЫ
+# ==========================
+@dp.callback_query(F.data == "triggers")
+async def trig_menu(cb: CallbackQuery):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить триггер", callback_data="tr_add")
+    kb.button(text="📃 Список", callback_data="tr_list")
+    kb.adjust(1)
+    await cb.message.edit_text("Управление автоответами:", reply_markup=kb.as_markup())
 
 
-# ——————————— GREETING ———————————
-async def greet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.chat_member
-    old, new = data.old_chat_member, data.new_chat_member
+@dp.callback_query(F.data == "tr_add")
+async def trig_add_wait(cb: CallbackQuery):
+    await cb.message.edit_text("Напиши триггер в формате:\n`триггер | ответ`", parse_mode="Markdown")
 
-    if old.status in ("left", "kicked") and new.status in ("member", "restricted", "administrator"):
-        u = new.user
-        chat = update.effective_chat
+    @dp.message()
+    async def save_trigger(msg: Message):
+        if "|" not in msg.text:
+            return await msg.answer("Формат: `привет | и тебе хай`")
 
-        rules = await get_rules(chat.id) or DEFAULT_RULES
-        msg = WELCOME_TEXT.format(name=u.first_name, chat=chat.title)
-        msg += "\n\n" + rules
+        t, r = msg.text.split("|", 1)
+        cursor.execute("INSERT INTO triggers (trigger, response) VALUES (?,?)",
+                       (t.strip().lower(), r.strip()))
+        db.commit()
 
-        await context.bot.send_message(chat.id, msg)
-
-
-# ——————————— ANTIFLOOD (simple) ———————————
-spam_cache = {}
-
-async def antiflood(update, context):
-    user = update.effective_user
-    chat = update.effective_chat
-    now = datetime.utcnow().timestamp()
-
-    key = f"{chat.id}:{user.id}"
-    last = spam_cache.get(key, 0)
-
-    if now - last < 0.6:
-        lvl = await get_level(chat.id, user.id)
-        if lvl < 2:
-            await update.message.delete()
-            return
-    spam_cache[key] = now
+        await msg.answer("Готово 🔥 Триггер сохранён.")
+        dp.message.handlers.pop()
 
 
-# —————————————————— MAIN ——————————————————
+@dp.callback_query(F.data == "tr_list")
+async def trig_list(cb: CallbackQuery):
+    cursor.execute("SELECT trigger, response FROM triggers")
+    rows = cursor.fetchall()
+    if not rows:
+        return await cb.message.edit_text("Нет триггеров.", reply_markup=main_menu())
+
+    text = "🤖 *Триггеры:*\n\n"
+    for t, r in rows:
+        text += f"• `{t}` → {r}\n"
+
+    await cb.message.edit_text(text, reply_markup=main_menu(), parse_mode="Markdown")
+
+
+# ==========================
+# ОБРАБОТЧИК СООБЩЕНИЙ (статистика + триггеры)
+# ==========================
+@dp.message()
+async def msg_handler(msg: Message):
+    uid = msg.from_user.id
+    add_user(uid)
+    add_message(uid)
+
+    text = msg.text.lower()
+
+    cursor.execute("SELECT response FROM triggers WHERE trigger = ?", (text,))
+    row = cursor.fetchone()
+    if row:
+        await msg.answer(row[0])
+
+
+# ==========================
+# RUN
+# ==========================
 async def main():
-    await init_db()
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("rules", rules))
-    app.add_handler(CommandHandler("setrules", setrules))
-    app.add_handler(CommandHandler("setlevel", setlevel))
-    app.add_handler(CommandHandler("info", info))
-    app.add_handler(CommandHandler("warn", warn))
-    app.add_handler(CommandHandler("warns", warns_list))
-    app.add_handler(CommandHandler("clearwarns", clearwarns))
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("unmute", unmute))
-    app.add_handler(CommandHandler("kick", kick))
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("unban", unban))
-
-    app.add_handler(ChatMemberHandler(greet, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), antiflood))
-
-    await app.run_polling()
-
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
